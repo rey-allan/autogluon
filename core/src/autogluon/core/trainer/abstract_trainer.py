@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import math
 import os
 import shutil
 import sys
@@ -16,11 +17,12 @@ import numpy as np
 import pandas as pd
 
 from autogluon.common.features.feature_metadata import FeatureMetadata
+from autogluon.common.utils.distribute_utils import DistributedContext
 from autogluon.common.utils.lite import disable_if_lite_mode
 from autogluon.common.utils.log_utils import convert_time_in_s_to_log_friendly
 from autogluon.common.utils.path_converter import PathConverter
-from autogluon.common.utils.resource_utils import ResourceManager
-from autogluon.common.utils.try_import import try_import_torch
+from autogluon.common.utils.resource_utils import ResourceManager, get_resource_manager
+from autogluon.common.utils.try_import import try_import_ray, try_import_torch
 
 from ..augmentation.distill_utils import augment_data, format_distillation_labels
 from ..calibrate import calibrate_decision_threshold
@@ -76,6 +78,16 @@ logger = logging.getLogger(__name__)
 #  Weird interaction for metrics like AUC during bagging.
 #  If kfold = 5, scores are 0.9, 0.85, 0.8, 0.75, and 0.7, the score is not 0.8! It is much lower because probs are combined together and AUC is recalculated
 #  Do we want this to happen? Should we calculate score by 5 separate scores and then averaging instead?
+
+
+# TODO: Extract into a separate class (e.g. `ParallelClient`)
+_resource_manager = get_resource_manager()
+_ray = try_import_ray()
+
+def _ray_train(cls: AbstractTrainer, *args, **kwargs):
+    return cls._train_single_full(*args, **kwargs)
+
+_ray_train_remote = _ray.remote(max_calls=1)(_ray_train)
 
 
 # TODO: Dynamic model loading for ensemble models during prediction, only load more models if prediction is uncertain. This dynamically reduces inference time.
@@ -1845,36 +1857,61 @@ class AbstractTrainer:
         return model
 
     def _train_and_save(
-        self, X, y, model: AbstractModel, X_val=None, y_val=None, stack_name="core", level=1, compute_score=True, total_resources=None, **model_fit_kwargs
-    ) -> List[str]:
+        self,
+        X,
+        y,
+        model: AbstractModel,
+        X_val=None,
+        y_val=None,
+        stack_name="core",
+        level=1,
+        compute_score=True,
+        total_resources=None,
+        **model_fit_kwargs,
+    ) -> Tuple[str, float, Dict[str, Any], np.ndarray, bool]:
         """
-        Trains model and saves it to disk, returning a list with a single element: The name of the model, or no elements if training failed.
+        Trains model and saves it to disk.
+        Returns
+            - The model name
+            - The validation score
+            - The model metadata (attributes and other information)
+            - The validation prediction probabilities
+            - A boolean indicating whether the model was trained or not
+
         If the model name is returned:
-            The model can be accessed via self.load_model(model.name).
-            The model will have metadata information stored in self.model_graph.
-            The model's name will be appended to self.models_level[stack_name][level]
-            The model will be accessible and usable through any Trainer function that takes as input 'model' or 'model_name'.
+            - The model can be accessed via self.load_model(model.name).
+            - The model will have metadata information stored in self.model_graph.
+            - The model's name will be appended to self.models_level[stack_name][level]
+            - The model will be accessible and usable through any Trainer function that takes as input 'model' or 'model_name'.
+
         Note: self._train_and_save should not be used outside of self._train_single_full
         """
         X_pseudo = model_fit_kwargs.get("X_pseudo", None)
         y_pseudo = model_fit_kwargs.get("y_pseudo", None)
         fit_start_time = time.time()
         time_limit = model_fit_kwargs.get("time_limit", None)
-        model_names_trained = []
+
+        model_trained = model.name
+        val_score = None
+        model_metadata = {}
         y_pred_proba_val = None
+        trained = False
+
         try:
             fit_log_message = f"Fitting model: {model.name} ..."
+
             if time_limit is not None:
                 if time_limit <= 0:
                     logger.log(15, f"Skipping {model.name} due to lack of time remaining.")
-                    return model_names_trained
+                    return model_trained, val_score, model_metadata, y_pred_proba_val, trained
+
                 if self._time_limit is not None and self._time_train_start is not None:
                     time_left_total = self._time_limit - (fit_start_time - self._time_train_start)
                     # If only a very small amount of time remains, skip training
                     min_time_required = min(self._time_limit * 0.01, 10)
                     if (time_left_total < min_time_required) and (time_limit < min_time_required):
                         logger.log(15, f"Skipping {model.name} due to lack of time remaining.")
-                        return model_names_trained
+                        return model_trained, val_score, model_metadata, y_pred_proba_val, trained
                 else:
                     time_left_total = time_limit
                 fit_log_message += f" Training model for up to {round(time_limit, 2)}s of the {round(time_left_total, 2)}s of remaining time."
@@ -1969,11 +2006,18 @@ class AbstractTrainer:
             if del_model:
                 del model
         else:
-            self._add_model(model=model, stack_name=stack_name, level=level, y_pred_proba_val=y_pred_proba_val)
-            model_names_trained.append(model.name)
+            trained = True
+            val_score = model.val_score
+            model_metadata = self._get_model_metadata(model=model, stack_name=stack_name, level=level)
+
+            # Add metadata related to stacking, if available
+            model_metadata["stack_column_prefixes"] = model.stack_column_prefix_lst if isinstance(model, StackerEnsembleModel) else None
+            model_metadata["stack_column_prefix_to_model_map"] = model.stack_column_prefix_to_model_map if isinstance(model, StackerEnsembleModel) else None
+
             if self.low_memory:
                 del model
-        return model_names_trained
+
+        return model_trained, val_score, model_metadata, y_pred_proba_val, trained
 
     # FIXME: v1.0 Move to AbstractModel for most fields
     def _get_model_metadata(self, model: AbstractModel, stack_name: str = "core", level: int = 1) -> Dict[str, Any]:
@@ -2070,6 +2114,76 @@ class AbstractTrainer:
         if self.low_memory:
             del model
         return True
+
+    def _add_model_information(self, model_name: str, val_score: float, model_metadata: Dict[str, Any], y_pred_proba_val: float=None) -> bool:
+        """
+        Registers the model information in the Trainer's model graph.
+
+        Parameters
+        ----------
+        model_name : str
+            Name of the model to add to the model graph.
+        val_score: float
+            Validation score of the model.
+        model_metadata : Dict[str, Any]
+            Dictionary of model metadata attributes.
+        y_pred_proba_val : float
+            Validation prediction probabilities.
+
+        Returns
+        -------
+        boolean, True if model information was registered, False if model was found to be invalid and not registered.
+        """
+        if val_score is not None and np.isnan(val_score):
+            logger.warning(f"WARNING: {model_name} has a val_score of {val_score} (NaN)! This should never happen. The model info will not be saved to avoid instability.")
+            return False
+
+        # TODO: Add to HPO
+
+        if y_pred_proba_val is not None:
+            # Cache y_pred_proba_val for later reuse to avoid redundant predict calls
+            self._save_model_y_pred_proba_val(model=model_name, y_pred_proba_val=y_pred_proba_val)
+            model_metadata["cached_y_pred_proba_val"] = True
+
+        self.model_graph.add_node(model_name, **model_metadata)
+
+        # FIXME: Modify `_log_model_stats` to avoid depending on the `model` object itself
+        # self._log_model_stats(model, _is_refit=_is_refit)
+
+        return True
+
+    def _add_model_dependencies(self, model_name: str, stack_column_prefixes: List[str], stack_column_prefix_to_model_map: Dict[str, str], level: int) -> None:
+        """
+        Adds model dependencies to the model graph.
+
+        Parameters
+        ----------
+        model_name : str
+            Name of the model to add dependencies to.
+        stack_column_prefixes : List[str]
+            List of stack column prefixes for the model.
+        stack_column_prefix_to_model_map : Dict[str, str]
+            Dictionary mapping stack column prefixes to model names.
+        level : int
+            Stack level of the model.
+        """
+        prior_models = self.get_model_names()
+
+        # TODO: raise exception if no base models and level != 1?
+        for stack_column_prefix in stack_column_prefixes:
+            base_model_name = stack_column_prefix_to_model_map[stack_column_prefix]
+
+            if base_model_name not in prior_models:
+                raise AssertionError(
+                    f"Model '{model_name}' depends on model '{base_model_name}', but '{base_model_name}' is not registered as a trained model! Valid models: {prior_models}"
+                )
+            elif level <= self.model_graph.nodes[base_model_name]["level"]:
+                raise AssertionError(
+                    f"Model '{model_name}' depends on model '{base_model_name}', but '{base_model_name}' is not in a lower stack level. ('{model_name}' level: {level}, '{base_model_name}' level: {self.model_graph.nodes[base_model_name]['level']})"
+                )
+
+            self.model_graph.add_edge(base_model_name, model_name)
+
 
     def _path_attr_model(self, model: str):
         """Returns directory where attributes are cached"""
@@ -2185,10 +2299,10 @@ class AbstractTrainer:
         compute_score=True,
         total_resources=None,
         **kwargs,
-    ) -> List[str]:
+    ) -> Tuple[str, float, Dict[str, Any], np.ndarray, bool]:
         """
         Trains a model, with the potential to train multiple versions of this model with hyperparameter tuning and feature pruning.
-        Returns a list of successfully trained and saved model names.
+        Returns the training results from `_train_and_save()`.
         Models trained from this method will be accessible in this Trainer.
         """
         model_fit_kwargs = self._get_model_fit_kwargs(
@@ -2266,7 +2380,7 @@ class AbstractTrainer:
                     k_fold=k_fold, k_fold_start=k_fold_start, k_fold_end=k_fold_end, n_repeats=n_repeats, n_repeat_start=n_repeat_start
                 )
                 model_fit_kwargs.update(bagged_model_fit_kwargs)
-            model_names_trained = self._train_and_save(
+            training_results = self._train_and_save(
                 X=X,
                 y=y,
                 model=model,
@@ -2280,7 +2394,7 @@ class AbstractTrainer:
                 **model_fit_kwargs,
             )
         self.save()
-        return model_names_trained
+        return training_results
 
     # TODO: How to deal with models that fail during this? They have trained valid models before, but should we still use those models or remove the entire model? Currently we still use models.
     # TODO: Time allowance can be made better by only using time taken during final model training and not during HPO and feature pruning.
@@ -2469,21 +2583,47 @@ class AbstractTrainer:
         """
         models_valid = []
         time_start = time.time()
-        if time_limit is not None:
-            time_limit = time_limit * time_ratio
+        time_limit = time_limit * time_ratio if time_limit is not None else time_limit
+
         if time_limit is not None and len(models) > 0:
             time_limit_model_split = time_limit / len(models)
         else:
             time_limit_model_split = time_limit
+
+        total_cpus = _resource_manager.get_cpu_count()
+        total_gpus = _resource_manager.get_gpu_count()
+
+        if not _ray.is_initialized():
+            is_distributed = DistributedContext.is_distributed_mode()
+            logger.info(f"[Parallel Model Training]: Initializing Ray with {total_cpus} CPUs and {total_gpus} GPUs in {'distributed mode' if is_distributed else 'local mode'}")
+            _ray.init(address="auto" if is_distributed else None, num_cpus=total_cpus, num_gpus=total_gpus, logging_level=logging.ERROR, log_to_driver=False)
+
+        # Prepare shared data
+        X_ref = _ray.put(X)
+        y_ref = _ray.put(y)
+        self_ref = _ray.put(self)
+
+        # Prepare resources
+        cpus_per_task = math.ceil(total_cpus / len(models))
+        gpus_per_task = math.ceil(total_gpus / len(models))
+        logger.info(f"[Parallel Model Training]: CPUs per task {cpus_per_task} | GPUs per task {gpus_per_task}")
+
+        head_node_id = _ray.get_runtime_context().get_node_id()
+        logger.info(f"[Parallel Model Training]: Dispatching model training tasks on node {head_node_id}")
+
+        jobs = []
+        job_to_model = {}
         for i, model in enumerate(models):
             if isinstance(model, str):
                 model = self.load_model(model)
             elif self.low_memory:
                 model = copy.deepcopy(model)
+
             if hyperparameter_tune_kwargs is not None and isinstance(hyperparameter_tune_kwargs, dict):
                 hyperparameter_tune_kwargs_model = hyperparameter_tune_kwargs.get(model.name, None)
             else:
                 hyperparameter_tune_kwargs_model = None
+
             # TODO: Only update scores when finished, only update model as part of final models if finished!
             if time_split:
                 time_left = time_limit_model_split
@@ -2493,14 +2633,51 @@ class AbstractTrainer:
                 else:
                     time_start_model = time.time()
                     time_left = time_limit - (time_start_model - time_start)
-            model_name_trained_lst = self._train_single_full(
-                X, y, model, time_limit=time_left, hyperparameter_tune_kwargs=hyperparameter_tune_kwargs_model, **kwargs
+
+            # Prepare shared model
+            model_ref = _ray.put(model)
+
+            logger.info(f"[Parallel Model Training]: Scheduling training task for model: {model.name}")
+            job_ref = _ray_train_remote.options(
+                num_cpus=cpus_per_task,
+                num_gpus=gpus_per_task,
+                scheduling_strategy=_ray.util.scheduling_strategies.PlacementGroupSchedulingStrategy(placement_group=_ray.util.get_current_placement_group()),
+            ).remote(
+                self_ref,
+                X_ref,
+                y_ref,
+                model_ref,
+                time_left=time_left,
+                hyperparameter_tune_kwargs=hyperparameter_tune_kwargs_model,
+                **kwargs,
             )
+
+            jobs.append(job_ref)
+            job_to_model[job_ref] = model.name
+
+            model_cls = type(model)
 
             if self.low_memory:
                 del model
-            models_valid += model_name_trained_lst
 
+        unfinished = jobs
+        while unfinished:
+            logger.info(f"[Parallel Model Training]: Waiting for training jobs to finish ({len(unfinished)} / {len(jobs)} remaining)")
+            finished, unfinished = _ray.wait(unfinished, num_returns=1)
+            finished = finished[0]
+
+            # TODO: Handle errors
+            logger.info(f"[Parallel Model Training]: Blocking and getting results for training job for model: {job_to_model[finished]}")
+            model_trained, val_score, model_metadata, y_pred_proba_val, trained = _ray.get(finished)
+
+            if trained:
+                models_valid += [model_trained]
+                self._add_model_information(model_trained, val_score, model_metadata, y_pred_proba_val)
+
+                if model_cls is StackerEnsembleModel:
+                    self._add_model_dependencies(model_trained, model_metadata["stack_column_prefixes"], model_metadata["stack_column_prefix_to_model_map"], kwargs["level"])
+
+        logger.info(f"[Parallel Model Training]: All {len(jobs)} training jobs finished!")
         return models_valid
 
     def _train_multi(
