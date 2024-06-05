@@ -148,6 +148,10 @@ class ResourceManager:
         return shutil.disk_usage(path=path)
 
     @staticmethod
+    def get_node_count() -> int:
+        return 1
+
+    @staticmethod
     def _get_gpu_count_cuda():
         # FIXME: Sometimes doesn't detect GPU on Windows
         # FIXME: Doesn't ensure the GPUs are actually usable by the model (PyTorch, etc.)
@@ -222,6 +226,15 @@ class RayResourceManager:
     def get_gpu_count() -> int:
         """Get number of gpus available in the cluster"""
         return int(RayResourceManager._get_cluster_resources("GPU"))
+
+    @staticmethod
+    def get_node_count() -> int:
+        """Get number of nodes available in the cluster"""
+        try_import_ray()
+        import ray
+
+        RayResourceManager._init_ray()
+        return len(list(filter(lambda node: node['Alive'], ray.nodes())))
 
 
 def get_resource_manager():

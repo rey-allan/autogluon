@@ -2591,7 +2591,10 @@ class AbstractTrainer:
             time_limit_model_split = time_limit
 
         total_cpus = _resource_manager.get_cpu_count()
+        cpus_per_node = int(total_cpus / _resource_manager.get_node_count())
+
         total_gpus = _resource_manager.get_gpu_count()
+        gpus_per_node = int(total_gpus / _resource_manager.get_node_count())
 
         if not _ray.is_initialized():
             is_distributed = DistributedContext.is_distributed_mode()
@@ -2604,8 +2607,8 @@ class AbstractTrainer:
         self_ref = _ray.put(self)
 
         # Prepare resources
-        cpus_per_task = math.ceil(total_cpus / len(models))
-        gpus_per_task = math.ceil(total_gpus / len(models))
+        cpus_per_task = cpus_per_node if len(models) == 1 else math.ceil(total_cpus / len(models))
+        gpus_per_task = gpus_per_node if len(models) == 1 else math.ceil(total_gpus / len(models))
         logger.info(f"[Parallel Model Training]: CPUs per task {cpus_per_task} | GPUs per task {gpus_per_task}")
 
         head_node_id = _ray.get_runtime_context().get_node_id()
