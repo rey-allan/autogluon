@@ -18,3 +18,8 @@ class DistributedContext:
     def is_distributed_mode() -> bool:
         """Return if the current context is in distributed mode or not"""
         return os.environ.get("AG_DISTRIBUTED_MODE", False)
+
+    @staticmethod
+    def is_shared_network_file_system() -> bool:
+        """Return if the current context is using a shared (network) file system."""
+        return os.environ.get("AG_DISTRIBUTED_MODE_NFS", False)
